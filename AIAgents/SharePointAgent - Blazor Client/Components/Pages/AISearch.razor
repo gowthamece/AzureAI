@@ -1,0 +1,303 @@
+﻿@page "/aisearch"
+@using Microsoft.AspNetCore.Authorization
+@using Azure.AI.OpenAI
+@using Azure
+@using System.Text.Json
+@using System.Net.Http.Json
+@inject IConfiguration Configuration
+@inject IHttpClientFactory HttpClientFactory
+@attribute [Authorize]
+@rendermode InteractiveServer
+
+<h3>AI Document Search</h3>
+
+<div class="mb-2">
+    <textarea @bind="UserPrompt" rows="4" class="form-control" placeholder="Ask a question..."></textarea>
+</div>
+
+<div class="form-check mb-2">
+    <input class="form-check-input" type="checkbox" id="useSemanticSearch" @bind="UseVectorSearch" />
+    <label class="form-check-label" for="useSemanticSearch">Use semantic search (better understanding)</label>
+</div>
+
+<button @onclick="SubmitPrompt" class="btn btn-primary" disabled="@IsLoading">
+    @if (IsLoading)
+    {
+        <span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
+        <span> Searching...</span>
+    }
+    else
+    {
+        <span>Search</span>
+    }
+</button>
+
+<div class="mt-3">
+    @((MarkupString)ResponseText)
+</div>
+
+@code {
+    private string UserPrompt = "";
+    private string ResponseText = "";
+    private bool IsLoading = false;
+    private bool UseVectorSearch = true;
+    private string[] AvailableContentFields = new[] { "content", "text", "body", "chunk", "Content", "Text", "Body" };
+    private string[] AvailableTitleFields = new[] { "title", "name", "metadata_title", "Title", "Name", "filename", "fileName", "path" };
+   
+    private async Task SubmitPrompt()
+    {
+        if (string.IsNullOrWhiteSpace(UserPrompt)) return;
+
+        IsLoading = true;
+        ResponseText = "";
+
+        try
+        {
+            // Determine search type based on user selection
+            bool useSemanticSearch = UseVectorSearch; // Reusing the existing checkbox for semantic search
+
+            // Create search request based on selected search type
+            object searchRequest;
+
+            if (useSemanticSearch)
+            {
+                try
+                {
+                    // First attempt with hybrid search (vector + keywords)
+                    // Create basic keyword search request
+                    searchRequest = new
+                    {
+                        search = UserPrompt,
+                        queryType = "semantic",
+                        semanticConfiguration = "default",
+                        top = 5,
+                        select = "*",
+                        
+                    };
+
+                    ResponseText += "<div class='alert alert-info mb-2'>Trying semantic search...</div>";
+                }
+                catch
+                {
+                    // If we catch an error here, fall back to standard search
+                    useSemanticSearch = false;
+                    searchRequest = new
+                    {
+                        search = UserPrompt,
+                        queryType = "simple",
+                        select = "*",
+                        top = 5
+                    };
+
+                    ResponseText += "<div class='alert alert-warning mb-2'>Semantic search configuration is not available. Using standard search instead.</div>";
+                }
+            }
+            else
+            {
+                // Standard keyword search
+                searchRequest = new
+                {
+                    search = UserPrompt,
+                    queryType = "simple",
+                    select = "*",
+                    top = 5
+                };
+
+                ResponseText += "<div class='alert alert-info mb-2'>Using standard keyword search...</div>";
+            }
+
+            // Create a custom HTTP client to call your search service
+            var httpClient = HttpClientFactory.CreateClient();
+            var key = Configuration["AzureSearch:Key"];
+            httpClient.DefaultRequestHeaders.Add("api-key", key);
+
+            // Adjust the URL to match your actual Azure AI Search service
+            var searchServiceName = Configuration["AzureSearch:Name"] ?? "srch-aicrawl";
+            var indexName = Configuration["AzureSearch:Index"] ?? "sharepoint-ai-index";
+            var searchUrl = $"https://{searchServiceName}.search.windows.net/indexes/{indexName}/docs/search?api-version=2023-11-01";
+
+            var searchResponse = await httpClient.PostAsJsonAsync(searchUrl, searchRequest);
+            var responseContent = await searchResponse.Content.ReadAsStringAsync();
+
+            if (!searchResponse.IsSuccessStatusCode)
+            {
+                // If semantic search failed, try standard search instead
+                if (useSemanticSearch && (
+                    responseContent.Contains("semanticConfiguration") ||
+                    responseContent.Contains("Semantic search is not supported")))
+                {
+                    ResponseText += "<div class='alert alert-warning'>Semantic search is not available for this index. Falling back to standard search.</div>";
+
+                    // Fallback to standard search
+                    searchRequest = new
+                    {
+                        search = UserPrompt,
+                        queryType = "simple",
+                        select = "*",
+                        top = 5
+                    };
+
+                    searchResponse = await httpClient.PostAsJsonAsync(searchUrl, searchRequest);
+                    responseContent = await searchResponse.Content.ReadAsStringAsync();
+
+                    // Reset the flag since we're using standard search now
+                    useSemanticSearch = false;
+                }
+
+                // If it still fails, show the error
+                if (!searchResponse.IsSuccessStatusCode)
+                {
+                    ResponseText += $@"<p class='text-danger'>Search failed: {searchResponse.StatusCode}</p>
+                                <pre class='text-danger small'>{responseContent}</pre>";
+                    return;
+                }
+            }
+
+            var searchResults = JsonDocument.Parse(responseContent).RootElement;
+
+            // Build the UI with search results and summaries
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("<h4>Search Results:</h4>");
+
+            if (searchResults.TryGetProperty("value", out var resultsArray) &&
+                resultsArray.GetArrayLength() > 0)
+            {
+                // Process each result
+                foreach (var result in resultsArray.EnumerateArray())
+                {
+                    // Filter by reranker score if using semantic search
+                    if (useSemanticSearch)
+                    {
+                        if (!result.TryGetProperty("@search.rerankerScore", out var rerankerScoreElement) ||
+                            !rerankerScoreElement.TryGetDouble(out double rerankerScoreValue) ||
+                            rerankerScoreValue <= 2)
+                        {
+                            continue; // Skip this result
+                        }
+                    }
+
+                    sb.AppendLine("<div class='search-result'>");
+
+                    // Try to find SharePoint URL
+                    string sharePointUrl = null;
+                    foreach (var field in new[] { "url", "webUrl", "path", "metadata_spo_item_url", "web_url", "file_url", "source_url", "parent_id" })
+                    {
+                        if (result.TryGetProperty(field, out var url))
+                        {
+                            sharePointUrl = url.ToString();
+                            break;
+                        }
+                    }
+
+                    // Try to find document title
+                    string documentTitle = "Unknown Document";
+                    foreach (var field in AvailableTitleFields)
+                    {
+                        if (result.TryGetProperty(field, out var title))
+                        {
+                            documentTitle = title.ToString();
+                            break;
+                        }
+                    }
+
+                    // Try to find document content for display
+                    string documentContent = null;
+                    foreach (var field in AvailableContentFields)
+                    {
+                        if (result.TryGetProperty(field, out var content))
+                        {
+                            documentContent = content.ToString();
+                            break;
+                        }
+                    }
+
+                    // Display semantic captions if available (semantic search only)
+                    if (useSemanticSearch && result.TryGetProperty("@search.captions", out var captionsElement))
+                    {
+                        sb.AppendLine("<div class='semantic-highlights'>");
+                        sb.AppendLine("<p><strong>Key passages:</strong></p>");
+
+                        foreach (var caption in captionsElement.EnumerateArray())
+                        {
+                            if (caption.TryGetProperty("text", out var captionText))
+                            {
+                                sb.AppendLine($"<p class='caption-text'>{captionText}</p>");
+                            }
+                        }
+
+                        sb.AppendLine("</div>");
+
+                        // If we have captions, we can skip generating our own summary
+                        documentContent = null;
+                    }
+
+                    // Add title first for better visual hierarchy
+                    sb.AppendLine($"<h5>{documentTitle}</h5>");
+
+                    // Create a summary of the content if captions aren't available
+                    if (!string.IsNullOrEmpty(documentContent))
+                    {
+                        string summary = documentContent;
+                        if (documentContent.Length > 300)
+                        {
+                            summary = documentContent.Substring(0, 300) + "...";
+                        }
+
+                        // Add summary
+                        sb.AppendLine($"<p>{summary}</p>");
+                    }
+
+                    // Add SharePoint link if available
+                    if (!string.IsNullOrEmpty(sharePointUrl))
+                    {
+                        sb.AppendLine($"<p><a href='https://gowthamk91outlook.sharepoint.com/sites/TechnicalCloudDoc/{sharePointUrl}' target='_blank' class='btn btn-sm btn-outline-primary'>View in SharePoint</a></p>");
+                    }
+
+                    // Add relevance score
+                    if (result.TryGetProperty("@search.score", out var score))
+                    {
+                        sb.AppendLine($"<small><strong>Relevance:</strong> {score}</small>");
+                    }
+
+                    // Add reranker score if semantic search is used
+                    if (useSemanticSearch && result.TryGetProperty("@search.rerankerScore", out var rerankerScore))
+                    {
+                        sb.AppendLine($"<small> | <strong>Semantic Score:</strong> {rerankerScore}</small>");
+                    }
+
+                    sb.AppendLine("</div><hr/>");
+                }
+
+                ResponseText += sb.ToString();
+            }
+            else
+            {
+                ResponseText += "<p class='text-warning'>No relevant documents found. Try rephrasing your question.</p>";
+            }
+        }
+        catch (Exception ex)
+        {
+            ResponseText = $"<p class='text-danger'>An error occurred: {ex.Message}</p>";
+        }
+        finally
+        {
+            IsLoading = false;
+        }
+    }
+}
+
+<style>
+    .search-result {
+        margin-bottom: 15px;
+        padding: 10px;
+        background-color: #f9f9f9;
+        border-radius: 5px;
+    }
+    pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+        background-color: #f8f8f8;
+        padding: 10px;
+        border-radius: 4px;
+    }
+</style>
