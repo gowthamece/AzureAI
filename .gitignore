@@ -1,0 +1,9 @@
+﻿################################################################################
+# This .gitignore file was automatically created by Microsoft(R) Visual Studio.
+################################################################################
+
+/.vs/AI Prototypes/config
+/.vs/AI Prototypes/CopilotIndices/17.14.670.39694
+/.vs/AI Prototypes/FileContentIndex
+/.vs/AI Prototypes/v17
+/SharePointAgent/.vs
